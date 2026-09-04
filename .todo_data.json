@@ -1,0 +1,10 @@
+[
+  {
+    "task": "Test task",
+    "done": false
+  },
+  {
+    "task": "To be removed",
+    "done": false
+  }
+]
