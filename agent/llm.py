@@ -1,127 +1,252 @@
+"""LLM 接入层。
+
+- DeepSeekLLM：调用 DeepSeek（OpenAI 兼容协议）真实 API。
+  优先使用原生 function calling（模型基于工具 Schema 自主决策是否调用工具），
+  并带指数退避重试。全部配置统一从 agent/config.py 读取
+  （优先级：环境变量 > .env 文件 > 默认值）。
+- parse_text_response：LLM 纯文本输出的解析逻辑（无 function calling 时的兼容通道），
+  从文本中提取思考过程（thought）、工具调用（tool_calls）或最终答案（answer），
+  支持三种协议：整体 JSON、XML 风格标签、纯文本兜底。
+- FakeLLM：测试用的可脚本化假 LLM，按队列依次返回预设响应并记录收到的请求，
+  用于在离线环境下确定性测试 Agent 循环。
+"""
+
+import copy
 import json
 import re
-from .exceptions import LLMError
-from .logger import TraceLogger
+import time
+import uuid
 
-class LLMInterface:
-    def __init__(self, api_key=None, model="gpt-4o-mini", base_url=None):
-        self.client = None
-        self.model = model
-        self.base_url = base_url
-        self.use_mock = False
-        self._tool_registry = None
-        if api_key:
-            from openai import OpenAI
-            self.client = OpenAI(api_key=api_key, base_url=base_url)
-        else:
-            self.use_mock = True
+from . import config
+from .exceptions import LLMError, ParseError
 
-    def _parse_response(self, text):
-        text = text.strip()
-        try:
-            parsed = json.loads(text)
-            return {
-                "thought": parsed.get("thought", ""),
-                "tool_calls": parsed.get("tool_calls", []),
-                "answer": parsed.get("answer", "")
-            }
-        except json.JSONDecodeError:
-            pass
+_THOUGHT_RE = re.compile(r"<thought>(.*?)</thought>", re.DOTALL | re.IGNORECASE)
+_ANSWER_RE = re.compile(r"<answer>(.*?)</answer>", re.DOTALL | re.IGNORECASE)
+_INVOKE_RE = re.compile(r'<invoke\s+name="([^"]+)"\s*>(.*?)</invoke>', re.DOTALL | re.IGNORECASE)
 
-        thought_match = re.search(r'<thought>(.*?)</thought>', text, re.DOTALL)
-        tool_call_match = re.search(r'<invoke name="([^"]+)">(.*?)</invoke>', text, re.DOTALL)
-        answer_match = re.search(r'<answer>(.*?)</answer>', text, re.DOTALL)
 
-        if thought_match or tool_call_match or answer_match:
-            return {
-                "thought": thought_match.group(1).strip() if thought_match else "",
-                "tool_calls": self._parse_tool_calls(tool_call_match.group(1).strip()) if tool_call_match else [],
-                "answer": answer_match.group(1).strip() if answer_match else ""
-            }
+# ---------------------------------------------------------------------------
+# 文本协议解析
+# ---------------------------------------------------------------------------
 
-        return {"thought": "", "tool_calls": [], "answer": text}
+def _parse_invoke_args(args_text):
+    """解析 <invoke> 标签内的参数文本，容忍 <params> 包裹与 markdown 代码块围栏。"""
+    args_text = (args_text or "").strip()
+    m = re.fullmatch(r"<params>(.*)</params>", args_text, re.DOTALL)
+    if m:
+        args_text = m.group(1).strip()
+    args_text = re.sub(r"^```(?:json)?\s*|\s*```$", "", args_text).strip()
+    if not args_text:
+        return {}
+    try:
+        parsed = json.loads(args_text)
+    except json.JSONDecodeError:
+        return {"query": args_text}
+    return parsed if isinstance(parsed, dict) else {"input": parsed}
 
-    def _parse_tool_calls(self, text):
-        calls = []
-        pattern = r'<invoke name="([^"]+)">(.*?)</invoke>'
-        for match in re.finditer(pattern, text, re.DOTALL):
-            name = match.group(1)
-            args_str = match.group(2).strip()
+
+def _normalize_tool_calls(raw_calls):
+    """把各种形态的工具调用描述统一为 {"id", "name", "args"} 结构。"""
+    normalized = []
+    for call in raw_calls or []:
+        if not isinstance(call, dict):
+            continue
+        name = call.get("name") or call.get("tool")
+        if not name:
+            continue
+        args = call.get("args", call.get("arguments", {}))
+        if isinstance(args, str):
             try:
-                args = json.loads(args_str) if args_str else {}
+                args = json.loads(args)
             except json.JSONDecodeError:
-                args = {"query": args_str}
-            calls.append({"name": name, "args": args})
-        return calls
+                args = {"input": args}
+        if not isinstance(args, dict):
+            args = {"input": args}
+        normalized.append({
+            "id": call.get("id") or f"call_{uuid.uuid4().hex[:12]}",
+            "name": str(name),
+            "args": args,
+        })
+    return normalized
 
-    def chat(self, messages, session_id=None):
-        if self.use_mock:
-            return self._mock_chat(messages, session_id)
-        return self._real_chat(messages, session_id)
 
-    def _real_chat(self, messages, session_id=None):
-        from .exceptions import LLMError
-        try:
-            tools = self.get_function_schemas() or None
-            response = self.client.chat.completions.create(
-                model=self.model,
-                messages=messages,
-                tools=tools,
-                tool_choice="auto" if tools else None
+def parse_text_response(text):
+    """解析 LLM 的纯文本输出，提取 thought / tool_calls / answer。
+
+    支持三种协议（按顺序尝试）：
+    1. 整体为 JSON：{"thought": ..., "tool_calls": [...], "answer": ...}
+    2. XML 风格标签：<thought>..</thought> <invoke name="x">{...}</invoke> <answer>..</answer>
+    3. 兜底：整段文本视为最终答案
+    """
+    text = (text or "").strip()
+    if not text:
+        return {"thought": "", "tool_calls": [], "answer": ""}
+
+    # 协议一：整体 JSON
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        data = None
+    if isinstance(data, dict) and any(k in data for k in ("thought", "tool_calls", "answer")):
+        return {
+            "thought": str(data.get("thought", "")),
+            "tool_calls": _normalize_tool_calls(data.get("tool_calls")),
+            "answer": str(data.get("answer", "")),
+        }
+
+    # 协议二：XML 风格标签
+    thought_match = _THOUGHT_RE.search(text)
+    answer_match = _ANSWER_RE.search(text)
+    invokes = _INVOKE_RE.findall(text)
+    if thought_match or answer_match or invokes:
+        tool_calls = [
+            {
+                "id": f"call_{uuid.uuid4().hex[:12]}",
+                "name": name.strip(),
+                "args": _parse_invoke_args(body),
+            }
+            for name, body in invokes
+        ]
+        return {
+            "thought": thought_match.group(1).strip() if thought_match else "",
+            "tool_calls": tool_calls,
+            "answer": answer_match.group(1).strip() if answer_match else "",
+        }
+
+    # 协议三：兜底
+    return {"thought": "", "tool_calls": [], "answer": text}
+
+
+# ---------------------------------------------------------------------------
+# DeepSeek 真实 API
+# ---------------------------------------------------------------------------
+
+class DeepSeekLLM:
+    """DeepSeek 真实 API 客户端（OpenAI 兼容协议）。
+
+    配置来源（优先级：显式参数 > config.py（环境变量 / .env）> 默认值）：
+    - api_key:     DEEPSEEK_API_KEY（必填）
+    - model:       DEEPSEEK_MODEL，默认 deepseek-chat
+    - base_url:    DEEPSEEK_BASE_URL，默认 https://api.deepseek.com
+    - timeout:     DEEPSEEK_TIMEOUT，默认 60 秒
+    - max_retries: DEEPSEEK_MAX_RETRIES，默认 2
+    """
+
+    def __init__(self, api_key=None, model=None, base_url=None, timeout=None, max_retries=None):
+        self.api_key = api_key or config.DEEPSEEK_API_KEY
+        self.model = model or config.DEEPSEEK_MODEL
+        self.base_url = base_url or config.DEEPSEEK_BASE_URL
+        self.timeout = config.DEEPSEEK_TIMEOUT if timeout is None else timeout
+        self.max_retries = config.DEEPSEEK_MAX_RETRIES if max_retries is None else max_retries
+        if not self.api_key:
+            raise LLMError(
+                "缺少 DeepSeek API Key：请在环境变量或 .env 文件中设置 DEEPSEEK_API_KEY"
+                "（可参考 .env.example），或在构造 DeepSeekLLM(api_key=...) 时传入。"
             )
-            content = response.choices[0].message.content or ""
-            tool_calls = response.choices[0].message.tool_calls
-            if tool_calls:
-                parsed_calls = []
-                for tc in tool_calls:
-                    parsed_calls.append({"name": tc.function.name, "args": json.loads(tc.function.arguments)})
-                return {"thought": content, "tool_calls": parsed_calls, "answer": ""}
-            return self._parse_response(content)
-        except Exception as e:
-            raise LLMError(str(e))
+        try:
+            from openai import OpenAI
+        except ImportError as e:
+            raise LLMError("未安装 openai 包，请先执行: pip install openai") from e
+        self.client = OpenAI(api_key=self.api_key, base_url=self.base_url, timeout=self.timeout)
 
-    def _mock_chat(self, messages, session_id=None):
-        last_user_msg = ""
-        for msg in reversed(messages):
-            if msg.get("role") == "user":
-                last_user_msg = msg.get("content", "")
-                break
+    def chat(self, messages, tools=None, session_id=None):
+        """调用 LLM。返回统一结构 {"thought", "tool_calls", "answer"}。
 
-        response_text = self._generate_mock_response(last_user_msg, messages)
-        logger = TraceLogger()
-        logger.llm_response(response_text, session_id)
-        return self._parse_response(response_text)
+        - tools: OpenAI function-calling 格式的工具 Schema 列表；
+          LLM 基于该 Schema 自主决策是否调用工具。
+        - 网络类异常按指数退避重试，超过次数抛出 LLMError。
+        """
+        last_error = None
+        for attempt in range(self.max_retries + 1):
+            try:
+                return self._chat_once(messages, tools)
+            except (LLMError, ParseError):
+                raise
+            except Exception as e:  # 网络/限流等服务端异常，值得重试
+                last_error = e
+                if attempt < self.max_retries:
+                    time.sleep(min(2 ** attempt, 4))
+        raise LLMError(
+            f"DeepSeek API 调用失败（已重试 {self.max_retries} 次）: {last_error}"
+        )
 
-    def _generate_mock_response(self, user_msg, messages):
-        user_lower = user_msg.lower()
-        if any(kw in user_lower for kw in ["calculate", "计算", "what is", "plus", "minus", "multiply", "divide", "2 +", "3 *", "5 -"]):
-            return '<thought>Let me calculate that for you.</thought><answer>Here is the calculation result.</answer>'
-        if any(kw in user_lower for kw in ["search", "搜索", "find", "lookup"]):
-            return '<thought>Searching for information.</thought><answer>Here are the search results.</answer>'
-        if any(kw in user_lower for kw in ["weather", "温度", "forecast"]):
-            city = "Beijing"
-            for city_name in ["Beijing", "Shanghai", "Guangzhou", "Shenzhen", "Chengdu"]:
-                if city_name.lower() in user_lower:
-                    city = city_name
-                    break
-            return f'<thought>Let me check the weather for {city}.</thought><answer>Here is the weather forecast for {city}.</answer>'
-        if any(kw in user_lower for kw in ["todo", "task", "任务", "待办"]):
-            if any(kw in user_lower for kw in ["add", "创建", "记录", "new"]):
-                return '<thought>I will add this task to the todo list.</thought><answer>Task added to your todo list.</answer>'
-            return '<thought>Let me check the todo list.</thought><answer>Here are your todos.</answer>'
-        if any(kw in user_lower for kw in ["bye", "goodbye", "exit", "quit", "再见", "退出"]):
-            return '<thought>Goodbye! Have a great day.</thought><answer>Goodbye! Have a great day.</answer>'
-        return '<thought>Let me think about that.</thought><answer>That is an interesting question. Let me think more about it.</answer>'
+    def _chat_once(self, messages, tools):
+        kwargs = {"model": self.model, "messages": messages}
+        if tools:
+            kwargs["tools"] = tools
+            kwargs["tool_choice"] = "auto"
+        response = self.client.chat.completions.create(**kwargs)
+        return self._parse_api_response(response)
 
-    def get_function_schemas(self):
-        if self._tool_registry:
-            return self._tool_registry.get_function_schemas()
-        return None
+    def _parse_api_response(self, response):
+        """解析 API 响应。
 
-class MockLLM(LLMInterface):
-    def __init__(self, model="mock-llm"):
-        self._tool_registry = None
-        self.model = model
-        self.use_mock = True
-        self.client = None
-        self.base_url = None
+        - 走了原生 function calling：tool_calls 中提取 id/name/args，
+          content 中的文字作为思考过程（thought）。
+        - 未走 function calling：content 交给 parse_text_response 做文本协议解析。
+        """
+        message = response.choices[0].message
+        tool_calls = []
+        for tc in getattr(message, "tool_calls", None) or []:
+            try:
+                args = json.loads(tc.function.arguments or "{}")
+            except json.JSONDecodeError as e:
+                raise ParseError(f"工具 {tc.function.name} 的参数 JSON 解析失败: {e}")
+            if not isinstance(args, dict):
+                args = {"input": args}
+            tool_calls.append({"id": tc.id, "name": tc.function.name, "args": args})
+
+        if tool_calls:
+            return {"thought": message.content or "", "tool_calls": tool_calls, "answer": ""}
+        return parse_text_response(message.content or "")
+
+
+# ---------------------------------------------------------------------------
+# 测试用 FakeLLM
+# ---------------------------------------------------------------------------
+
+class FakeLLM:
+    """可脚本化的假 LLM：按队列依次返回预设响应，并完整记录收到的每次请求。
+
+    用于离线、确定性地测试 Agent 循环（工具调用、多轮迭代、追问等）。
+    """
+
+    def __init__(self, responses=None):
+        self.responses = list(responses or [])
+        self.received = []
+
+    def queue(self, response):
+        self.responses.append(response)
+        return self
+
+    def chat(self, messages, tools=None, session_id=None):
+        self.received.append({
+            "messages": copy.deepcopy(messages),
+            "tools": copy.deepcopy(tools),
+            "session_id": session_id,
+        })
+        if self.responses:
+            return self.responses.pop(0)
+        return {"thought": "", "tool_calls": [], "answer": "（FakeLLM 没有更多预设响应）"}
+
+
+# ---------------------------------------------------------------------------
+# 响应构造辅助（测试/示例用）
+# ---------------------------------------------------------------------------
+
+def text_response(answer, thought=""):
+    """构造一个"直接回答"的 LLM 响应。"""
+    return {"thought": thought, "tool_calls": [], "answer": answer}
+
+
+def tool_call_response(name, args, thought="", call_id=None):
+    """构造一个"调用工具"的 LLM 响应。"""
+    return {
+        "thought": thought,
+        "tool_calls": [{
+            "id": call_id or f"call_{uuid.uuid4().hex[:12]}",
+            "name": name,
+            "args": args,
+        }],
+        "answer": "",
+    }

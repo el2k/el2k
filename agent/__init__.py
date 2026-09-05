@@ -1,27 +1,51 @@
-from .tool_registry import get_default_registry, ToolRegistry
-from .llm import LLMInterface, MockLLM
-from .runtime import AgentRuntime
-from .session import SessionManager, Session
+"""EL2K Mini Agent：一个从零实现的轻量级 Agent Runtime。
+
+不依赖任何 Agent 框架（langgraph / openhands / ...），核心循环、工具注册、
+会话与上下文管理均为手写实现。LLM 通过 DeepSeek（OpenAI 兼容）真实 API 接入。
+"""
+
 from .context import ContextManager
+from .exceptions import (
+    AgentError,
+    ContextOverflowError,
+    LLMError,
+    ParseError,
+    SessionError,
+    ToolExecutionError,
+    ToolNotFoundError,
+)
+from .llm import (
+    DeepSeekLLM,
+    FakeLLM,
+    parse_text_response,
+    text_response,
+    tool_call_response,
+)
 from .logger import TraceLogger
-from .exceptions import AgentError, ToolNotFoundError, ToolExecutionError, LLMError, SessionError, ContextOverflowError, ParseError
-
-from .tools.calculator import calculator
-from .tools.search import search
-from .tools.todo import todo
-from .tools.weather import weather
-
-reg = get_default_registry()
-CalculatorTool = reg.get("calculator")
-SearchTool = reg.get("search")
-TodoTool = reg.get("todo")
-WeatherTool = reg.get("weather")
+from .runtime import AgentRuntime
+from .session import Session, SessionManager
+from .tool_registry import Tool, ToolRegistry
+from .tools import build_default_registry
 
 __all__ = [
-    'AgentRuntime', 'SessionManager', 'Session', 'ContextManager',
-    'ToolRegistry', 'LLMInterface', 'MockLLM', 'TraceLogger',
-    'get_default_registry', 'CalculatorTool', 'SearchTool', 'TodoTool', 'WeatherTool',
-    'AgentError', 'ToolNotFoundError', 'ToolExecutionError', 'LLMError',
-    'SessionError', 'ContextOverflowError', 'ParseError',
-    'calculator', 'search', 'todo', 'weather'
+    "AgentRuntime",
+    "Session",
+    "SessionManager",
+    "ContextManager",
+    "Tool",
+    "ToolRegistry",
+    "build_default_registry",
+    "DeepSeekLLM",
+    "FakeLLM",
+    "parse_text_response",
+    "text_response",
+    "tool_call_response",
+    "TraceLogger",
+    "AgentError",
+    "ToolNotFoundError",
+    "ToolExecutionError",
+    "LLMError",
+    "SessionError",
+    "ContextOverflowError",
+    "ParseError",
 ]

@@ -1,29 +1,47 @@
+"""calculator 工具：白名单算术表达式求值。"""
+
 import math
-from agent.tool_registry import get_default_registry, Tool
 
-reg = get_default_registry()
+from ..tool_registry import Tool
 
-@reg.register(
+
+def calculator(expression):
+    """计算数学表达式，支持 + - * / ** % 与 sqrt/abs/min/max/round/pow 等函数。"""
+    safe_globals = {"__builtins__": {}}
+    safe_locals = {
+        "math": math,
+        "sqrt": math.sqrt,
+        "abs": abs,
+        "min": min,
+        "max": max,
+        "round": round,
+        "pow": pow,
+    }
+    try:
+        result = eval(expression, safe_globals, safe_locals)  # noqa: S307 白名单求值
+    except Exception as e:
+        return {"error": f"无法计算表达式 '{expression}': {e}"}
+    if isinstance(result, float):
+        result = round(result, 10)
+    return {"expression": expression, "result": result}
+
+
+TOOL = Tool(
     name="calculator",
-    description="Perform arithmetic calculations. Supports +, -, *, /, **, sqrt, and basic expressions.",
+    description=(
+        "计算数学表达式。支持 +、-、*、/、**（幂）、%，"
+        "以及 sqrt/abs/min/max/round 等函数。"
+        "例如 '2 + 3 * 4'、'sqrt(16)'、'2 ** 10'。"
+    ),
     schema={
         "type": "object",
         "properties": {
             "expression": {
                 "type": "string",
-                "description": "Mathematical expression to evaluate, e.g. '2 + 3 * 4', 'sqrt(16)', '2 ** 10'"
+                "description": "要计算的数学表达式，例如 '2 + 3 * 4'、'sqrt(16)'",
             }
         },
-        "required": ["expression"]
-    }
+        "required": ["expression"],
+    },
+    func=calculator,
 )
-def calculator(expression):
-    safe_expr = expression.replace("sqrt", "math.sqrt")
-    allowed_names = {"math": math}
-    try:
-        result = eval(safe_expr, {"__builtins__": {}}, allowed_names)
-        if isinstance(result, float):
-            return round(result, 10)
-        return result
-    except Exception as e:
-        return f"Error: {str(e)}"

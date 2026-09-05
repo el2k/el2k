@@ -1,8 +1,2 @@
-# Minimal Agent Framework
-# Requirements:
-#   pip install openai pytest
-# Usage:
-#   python main.py
-#   pytest tests/
-
-agent-required
+openai>=1.30
+pytest>=7.0

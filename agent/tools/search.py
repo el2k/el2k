@@ -1,29 +1,41 @@
-from agent.tool_registry import get_default_registry, Tool
+"""search 工具：mock 网络搜索，返回构造好的演示结果。"""
 
-reg = get_default_registry()
+from ..tool_registry import Tool
 
-@reg.register(
+
+def search(query, num_results=5):
+    """按关键词搜索（mock 数据源）。"""
+    try:
+        n = max(1, min(int(num_results), 5))
+    except (TypeError, ValueError):
+        n = 5
+    results = [
+        {
+            "title": f"{query} - 相关结果 {i + 1}",
+            "url": f"https://example.com/search?q={query}&r={i + 1}",
+            "snippet": f"关于「{query}」的第 {i + 1} 条演示搜索结果（mock 数据源）。",
+        }
+        for i in range(n)
+    ]
+    return {"query": query, "results": results, "total": len(results), "source": "mock"}
+
+
+TOOL = Tool(
     name="search",
-    description="Search the web for information. Returns mock results for demo purposes.",
+    description="搜索互联网信息（当前为 mock 数据源，返回演示用搜索结果）。",
     schema={
         "type": "object",
         "properties": {
             "query": {
                 "type": "string",
-                "description": "The search query to look up"
+                "description": "搜索关键词",
             },
             "num_results": {
                 "type": "integer",
-                "description": "Number of results to return (default 5)",
-                "default": 5
-            }
+                "description": "返回结果数量，1-5，默认 5",
+            },
         },
-        "required": ["query"]
-    }
+        "required": ["query"],
+    },
+    func=search,
 )
-def search(query, num_results=5):
-    mock_results = [
-        {"title": f"Result {i+1} for '{query}'", "url": f"https://example.com/{i+1}", "snippet": f"This is mock search result {i+1} about '{query}'"}
-        for i in range(min(num_results, 5))
-    ]
-    return {"query": query, "results": mock_results, "total": len(mock_results)}
